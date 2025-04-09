@@ -1,0 +1,1355 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import folium
+from streamlit_folium import st_folium
+import requests
+from io import StringIO
+import datetime
+import calendar
+import io
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+
+# Aumentando o timeout para requisições
+import socket
+
+socket.setdefaulttimeout(30)  # Timeout de 30 segundos
+
+# Configuração da página
+st.set_page_config(
+    page_title="Chordeiles: Análise de sazonalidade de espécies",
+    page_icon="🦅",
+    layout="wide"
+)
+
+
+# Função para converter string de data para datetime
+def converter_data(data_str):
+    try:
+        return pd.to_datetime(data_str, format='%d/%m/%Y', errors='coerce')
+    except:
+        try:
+            return pd.to_datetime(data_str, errors='coerce')
+        except:
+            return None
+
+
+# Função para download de arquivo CSV do Google Sheets
+@st.cache_data(ttl=3600)
+def download_csv_from_google_sheet(sheet_url):
+    """
+    Faz download direto da planilha como CSV, sem necessidade de API ou credenciais.
+    Funciona apenas se a planilha estiver configurada para "Qualquer pessoa com o link pode visualizar".
+    """
+    try:
+        # Extrai o ID da planilha
+        sheet_id = sheet_url.split('/d/')[1].split('/edit')[0]
+
+        # Constrói a URL de exportação como CSV
+        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+
+        # Faz a requisição HTTP
+        response = requests.get(export_url)
+
+        # Verifica se a requisição foi bem-sucedida
+        if response.status_code == 200:
+            # Lê o conteúdo como CSV
+            csv_content = StringIO(response.content.decode('utf-8'))
+            df = pd.read_csv(csv_content, low_memory=False)
+            return df
+        else:
+            st.error(f"Erro ao baixar a planilha: {response.status_code}")
+            st.warning("Verifique se a planilha está configurada para 'Qualquer pessoa com o link pode visualizar'.")
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Erro ao fazer download da planilha: {e}")
+        return pd.DataFrame()
+
+
+# Função para carregar e processar dados
+def load_and_process_data(file_upload=None, sheet_url=None):
+    """Carrega e processa os dados de um arquivo upload ou Google Sheets"""
+
+    df = pd.DataFrame()
+
+    # Carregando dados do upload de arquivo
+    if file_upload is not None:
+        try:
+            # Obter o tipo de arquivo
+            file_extension = file_upload.name.split('.')[-1].lower()
+
+            if file_extension == 'csv':
+                df = pd.read_csv(file_upload, low_memory=False)
+            elif file_extension in ['xls', 'xlsx']:
+                df = pd.read_excel(file_upload)
+            else:
+                st.error("Formato de arquivo não suportado. Por favor, envie um arquivo CSV ou Excel.")
+                return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Erro ao carregar o arquivo: {e}")
+            return pd.DataFrame()
+
+    # Carregando dados do Google Sheets
+    elif sheet_url is not None and sheet_url.strip() != "":
+        df = download_csv_from_google_sheet(sheet_url)
+
+    # Verificação de dados
+    if df.empty:
+        return pd.DataFrame()
+
+    # Processamento dos dados
+    # Padronizando nomes de colunas
+    colunas_padronizadas = {
+        'id registro': 'id_registro',
+        'Espécie': 'especie',
+        'municipio e estado': 'municipio_estado',
+        'Data (d/m/a)': 'data',
+        'Autor': 'autor',
+        'Município': 'municipio',
+        'uf': 'estado',
+        'id município': 'id_municipio',
+        'latitude': 'latitude',
+        'longitude': 'longitude'
+    }
+
+    # Renomear colunas se existirem no DataFrame
+    for col_original, col_padronizada in colunas_padronizadas.items():
+        if col_original in df.columns:
+            df.rename(columns={col_original: col_padronizada}, inplace=True)
+
+    # Processando a data
+    if 'data' in df.columns:
+        df['data'] = df['data'].apply(converter_data)
+        df['ano'] = df['data'].dt.year
+        df['mes'] = df['data'].dt.month
+        df['mes_nome'] = df['data'].dt.month_name()
+
+    return df
+
+
+# Função para calcular indicadores
+def calcular_indicadores(df):
+    """Calcula os indicadores principais com base nos dados filtrados"""
+    # Número de registros
+    n_registros = len(df)
+
+    # Número de espécies únicas
+    n_especies = df['especie'].nunique() if 'especie' in df.columns else 0
+
+    # Localizações únicas (combinando município e estado)
+    if 'municipio' in df.columns and 'estado' in df.columns:
+        n_localizacoes = df.drop_duplicates(subset=['municipio', 'estado']).shape[0]
+    else:
+        n_localizacoes = 0
+
+    # Período dos dados
+    if 'data' in df.columns:
+        data_inicio = df['data'].min().strftime('%d/%m/%Y') if not pd.isna(df['data'].min()) else "N/A"
+        data_fim = df['data'].max().strftime('%d/%m/%Y') if not pd.isna(df['data'].max()) else "N/A"
+        periodo_dados = f"{data_inicio} a {data_fim}"
+    else:
+        periodo_dados = "N/A"
+
+    return {
+        'n_registros': n_registros,
+        'n_especies': n_especies,
+        'n_localizacoes': n_localizacoes,
+        'periodo_dados': periodo_dados
+    }
+
+
+# Função para gerar tabela de registros por espécie
+def gerar_tabela_registros_por_especie(df):
+    """Gera tabela com contagem de registros por espécie"""
+    if 'especie' not in df.columns:
+        return pd.DataFrame()
+
+    registros_por_especie = df['especie'].value_counts().reset_index()
+    registros_por_especie.columns = ['Espécie', 'Número de Registros']
+    return registros_por_especie
+
+
+# Função para gerar gráfico de registros por espécie
+def gerar_grafico_registros_por_especie(df, tipo_grafico):
+    """Gera gráfico de registros por espécie conforme tipo selecionado"""
+    if 'especie' not in df.columns:
+        return None
+
+    # Obter contagem de registros por espécie
+    registros_por_especie = df['especie'].value_counts().reset_index()
+    registros_por_especie.columns = ['Espécie', 'Número de Registros']
+
+    # Limitar para as 15 espécies mais registradas
+    top_especies = registros_por_especie.head(15)
+
+    if tipo_grafico == 'barras_horizontais':
+        fig = px.bar(
+            top_especies,
+            y='Espécie',
+            x='Número de Registros',
+            title='Espécies mais Registradas',
+            orientation='h',
+            color='Número de Registros',
+            color_continuous_scale='Viridis'
+        )
+    elif tipo_grafico == 'barras_verticais':
+        fig = px.bar(
+            top_especies,
+            x='Espécie',
+            y='Número de Registros',
+            title='Espécies mais Registradas',
+            color='Número de Registros',
+            color_continuous_scale='Viridis'
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+    elif tipo_grafico == 'pizza':
+        fig = px.pie(
+            top_especies,
+            values='Número de Registros',
+            names='Espécie',
+            title='Distribuição de Registros por Espécie'
+        )
+
+    fig.update_layout(
+        xaxis_title='Espécie',
+        yaxis_title='Número de Registros',
+        autosize=True
+    )
+
+    return fig
+
+
+# Função para gerar mapa de registros
+def gerar_mapa_registros(df, tipo_mapa, agrupar_pontos=True, grid_size=30,
+                         valores_personalizados=False, limiar_azul=5, limiar_azul_medio=10,
+                         limiar_amarelo=20, limiar_laranja=50):
+    """Gera mapa de registros conforme tipo selecionado
+
+    Args:
+        df: DataFrame com os dados
+        tipo_mapa: Tipo de mapa (pontos, calor, grid)
+        agrupar_pontos: Se True, agrupa pontos próximos em clusters
+        grid_size: Tamanho do grid para tipo 'grid'
+        valores_personalizados: Se True, usa limiares personalizados para cores
+        limiar_azul: Valor máximo para azul claro
+        limiar_azul_medio: Valor máximo para azul médio
+        limiar_amarelo: Valor máximo para amarelo
+        limiar_laranja: Valor máximo para laranja
+    """
+    if 'latitude' not in df.columns or 'longitude' not in df.columns:
+        return None
+
+    # Filtrando coordenadas válidas (sem chamar uma função separada)
+    df_mapa = df.copy()
+
+    # Convertendo para float para garantir
+    df_mapa['latitude'] = pd.to_numeric(df_mapa['latitude'], errors='coerce')
+    df_mapa['longitude'] = pd.to_numeric(df_mapa['longitude'], errors='coerce')
+
+    # Filtrar coordenadas válidas (dentro dos limites do planeta)
+    # Latitude: -90 a 90, Longitude: -180 a 180
+    validos = (
+            (df_mapa['latitude'] >= -90) & (df_mapa['latitude'] <= 90) &
+            (df_mapa['longitude'] >= -180) & (df_mapa['longitude'] <= 180)
+    )
+
+    # Contando registros inválidos
+    n_invalidos = (~validos).sum()
+    if n_invalidos > 0:
+        st.warning(f"⚠️ {n_invalidos} registros com coordenadas inválidas foram removidos.")
+
+    df_mapa = df_mapa[validos].reset_index(drop=True)
+
+    # Removendo registros sem coordenadas
+    df_mapa = df_mapa.dropna(subset=['latitude', 'longitude'])
+
+    if len(df_mapa) == 0:
+        st.error("Não existem coordenadas válidas nos dados selecionados.")
+        return None
+
+    # Limitar número de pontos para melhorar o desempenho
+    max_pontos = 2000  # Limite de pontos para evitar sobrecarga
+    if len(df_mapa) > max_pontos and tipo_mapa != 'grid':
+        st.warning(
+            f"Limitando o mapa a {max_pontos} pontos para melhor desempenho. Use filtros para visualizar dados específicos.")
+        df_mapa = df_mapa.sample(max_pontos, random_state=42)
+
+    try:
+        # Solução simples, evitando usar muitos parâmetros
+        # Usando apenas os parâmetros básicos necessários
+        mapa = folium.Map(
+            location=[-15.77972, -47.92972],  # Centro do Brasil (Brasília)
+            zoom_start=4,
+            tiles='OpenStreetMap'
+        )
+
+        # Adicionar camadas básicas
+        folium.TileLayer('OpenStreetMap', name='OpenStreetMap').add_to(mapa)
+
+        if tipo_mapa == 'pontos':
+            if agrupar_pontos:
+                # Usar MarkerCluster para agrupar pontos
+                from folium.plugins import MarkerCluster
+                marker_cluster = MarkerCluster().add_to(mapa)
+
+                # Adicionando pontos para cada registro
+                for idx, row in df_mapa.iterrows():
+                    try:
+                        popup_text = f"""
+                        <strong>Espécie:</strong> {row.get('especie', 'N/A')}<br>
+                        <strong>Local:</strong> {row.get('municipio', 'N/A')}/{row.get('estado', 'N/A')}<br>
+                        """
+
+                        folium.Marker(
+                            location=[float(row['latitude']), float(row['longitude'])],
+                            popup=folium.Popup(popup_text, max_width=300)
+                        ).add_to(marker_cluster)
+                    except Exception as e:
+                        continue
+            else:
+                # Adicionar pontos individualmente sem agrupar
+                for idx, row in df_mapa.iterrows():
+                    try:
+                        popup_text = f"""
+                        <strong>Espécie:</strong> {row.get('especie', 'N/A')}<br>
+                        <strong>Local:</strong> {row.get('municipio', 'N/A')}/{row.get('estado', 'N/A')}<br>
+                        """
+
+                        folium.Marker(
+                            location=[float(row['latitude']), float(row['longitude'])],
+                            popup=folium.Popup(popup_text, max_width=300),
+                            icon=folium.Icon(color='green')
+                        ).add_to(mapa)
+                    except Exception as e:
+                        continue
+
+        elif tipo_mapa == 'calor':
+            try:
+                # Preparando dados para mapa de calor, garantindo que sejam floats
+                heat_data = [[float(row['latitude']), float(row['longitude'])] for idx, row in df_mapa.iterrows()]
+
+                # Adicionando mapa de calor com configuração simplificada
+                from folium.plugins import HeatMap
+                HeatMap(heat_data).add_to(mapa)
+            except Exception as e:
+                st.error(f"Erro no mapa de calor: {e}")
+
+        elif tipo_mapa == 'grid':
+            try:
+                # Criar grid para visualização
+                # Definindo limites do grid
+                min_lat = df_mapa['latitude'].min()
+                max_lat = df_mapa['latitude'].max()
+                min_lon = df_mapa['longitude'].min()
+                max_lon = df_mapa['longitude'].max()
+
+                # Verificando se a área geográfica é válida
+                if min_lat > max_lat or min_lon > max_lon:
+                    st.error("Área geográfica inválida - verifique as coordenadas.")
+                    return mapa
+
+                # Usando o tamanho do grid passado como parâmetro
+
+                # Calculando o tamanho das células
+                lat_step = (max_lat - min_lat) / grid_size
+                lon_step = (max_lon - min_lon) / grid_size
+
+                # Verificando se os passos são válidos
+                if lat_step <= 0 or lon_step <= 0:
+                    st.warning("Área geográfica muito pequena para criar grid. Tente incluir mais dados.")
+                    return mapa
+
+                # Contadores para estatísticas do grid
+                celulas_total = grid_size * grid_size
+                celulas_com_dados = 0
+                max_registros = 0
+
+                # Criando células do grid
+                grid_cells = {}
+
+                # Atribuindo pontos às células do grid
+                for idx, row in df_mapa.iterrows():
+                    try:
+                        lat = float(row['latitude'])
+                        lon = float(row['longitude'])
+
+                        # Pular coordenadas que estão fora dos limites (caso tenha havido filtragem inadequada)
+                        if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+                            continue
+
+                        # Determinando a célula do grid para este ponto
+                        lat_idx = int((lat - min_lat) / lat_step)
+                        lon_idx = int((lon - min_lon) / lon_step)
+
+                        # Ajustando para evitar índices fora dos limites
+                        lat_idx = min(grid_size - 1, max(0, lat_idx))
+                        lon_idx = min(grid_size - 1, max(0, lon_idx))
+
+                        # Chave da célula
+                        cell_key = (lat_idx, lon_idx)
+
+                        # Incrementando contagem na célula
+                        if cell_key in grid_cells:
+                            grid_cells[cell_key]['count'] += 1
+                            grid_cells[cell_key]['species'].add(row.get('especie', 'N/A'))
+                        else:
+                            celulas_com_dados += 1
+                            grid_cells[cell_key] = {
+                                'count': 1,
+                                'lat': min_lat + (lat_idx + 0.5) * lat_step,
+                                'lon': min_lon + (lon_idx + 0.5) * lon_step,
+                                'species': {row.get('especie', 'N/A')}
+                            }
+                    except Exception as e:
+                        continue
+
+                # Encontrando o valor máximo para normalização de cores
+                if grid_cells:
+                    max_count = max([cell['count'] for cell in grid_cells.values()])
+                    max_registros = max_count
+                else:
+                    max_count = 1
+                    max_registros = 0
+
+                # Exibir informações sobre o grid para debug
+                st.write(f"Grid de {grid_size}x{grid_size} células ({celulas_total} células no total)")
+                st.write(f"Área geográfica: Lat [{min_lat:.2f} a {max_lat:.2f}], Lon [{min_lon:.2f} a {max_lon:.2f}]")
+                st.write(f"Tamanho da célula: {lat_step:.4f}° latitude x {lon_step:.4f}° longitude")
+                st.write(
+                    f"Células com registros: {celulas_com_dados} de {celulas_total} ({celulas_com_dados / celulas_total * 100:.1f}%)")
+                st.write(f"Máximo de registros em uma célula: {max_registros}")
+
+                # Criando uma classe para a legenda do mapa
+                class MacroElement(folium.MacroElement):
+                    def __init__(self, html_string):
+                        super(MacroElement, self).__init__()
+                        self._template = folium.elements.Template(html_string)
+
+                # Definir as cores e limiares para a legenda
+                if valores_personalizados:
+                    # Usar os limiares fornecidos pelo usuário
+                    valor_azul = limiar_azul
+                    valor_azul_medio = limiar_azul_medio
+                    valor_amarelo = limiar_amarelo
+                    valor_laranja = limiar_laranja
+                    valor_vermelho = f">{limiar_laranja}"
+                else:
+                    # Calculando limiares automáticos baseados na distribuição
+                    counts = [cell_data['count'] for cell_data in grid_cells.values()]
+                    if len(counts) == 0:
+                        # Se não há dados, usar valores padrão
+                        valor_azul = "1-5"
+                        valor_azul_medio = "6-10"
+                        valor_amarelo = "11-20"
+                        valor_laranja = "21-50"
+                        valor_vermelho = ">50"
+                    else:
+                        # Dividir em 5 categorias baseadas na distribuição
+                        max_count = max(counts)
+                        if max_count < 5:
+                            # Poucos registros, usar valores absolutos
+                            valor_azul = "1"
+                            valor_azul_medio = "2"
+                            valor_amarelo = "3"
+                            valor_laranja = "4"
+                            valor_vermelho = "≥5"
+                        else:
+                            # Usar valores relativos à distribuição
+                            valor_azul = f"1-{max(1, int(max_count * 0.2))}"
+                            valor_azul_medio = f"{int(max_count * 0.2) + 1}-{int(max_count * 0.4)}"
+                            valor_amarelo = f"{int(max_count * 0.4) + 1}-{int(max_count * 0.6)}"
+                            valor_laranja = f"{int(max_count * 0.6) + 1}-{int(max_count * 0.8)}"
+                            valor_vermelho = f"{int(max_count * 0.8) + 1}-{max_count}"
+
+                # Criando a legenda HTML
+                legend_html = f'''
+                <div id="maplegend" style="position: fixed; z-index:9999; border:2px solid grey; background-color:rgba(255, 255, 255, 0.8);
+                    border-radius:6px; padding: 10px; font-size:14px; right: 20px; bottom: 20px;">
+                    <div style="font-weight: bold; margin-bottom: 10px;">Número de Registros</div>
+                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <div style="background: #ADD8E6; width: 20px; height: 20px; margin-right: 8px; border: 1px solid #333;"></div>
+                        <span>{valor_azul}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <div style="background: #6495ED; width: 20px; height: 20px; margin-right: 8px; border: 1px solid #333;"></div>
+                        <span>{valor_azul_medio}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <div style="background: #FFFF00; width: 20px; height: 20px; margin-right: 8px; border: 1px solid #333;"></div>
+                        <span>{valor_amarelo}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <div style="background: #FFA500; width: 20px; height: 20px; margin-right: 8px; border: 1px solid #333;"></div>
+                        <span>{valor_laranja}</span>
+                    </div>
+                    <div style="display: flex; align-items: center;">
+                        <div style="background: #FF0000; width: 20px; height: 20px; margin-right: 8px; border: 1px solid #333;"></div>
+                        <span>{valor_vermelho}</span>
+                    </div>
+                </div>
+                <style>
+                @media(max-width: 992px) {{
+                    #maplegend {{
+                        display: block;
+                        max-width: 150px;
+                    }}
+                }}
+                </style>
+                '''
+
+                # Adicionando a legenda ao mapa usando a MacroElement
+                mapa.get_root().add_child(MacroElement(legend_html))
+
+                # Criando retângulos para cada célula do grid que contém dados
+                for cell_key, cell_data in grid_cells.items():
+                    # Calculando coordenadas do retângulo
+                    lat_idx, lon_idx = cell_key
+
+                    south = min_lat + lat_idx * lat_step
+                    north = min_lat + (lat_idx + 1) * lat_step
+                    west = min_lon + lon_idx * lon_step
+                    east = min_lon + (lon_idx + 1) * lon_step
+
+                    # Definindo cores baseadas nos limiares personalizados ou na contagem normalizada
+                    count = cell_data['count']
+
+                    if valores_personalizados:
+                        # Usando valores absolutos definidos pelo usuário
+                        if count <= limiar_azul:
+                            color = '#ADD8E6'  # Azul claro
+                            opacity = 0.6
+                        elif count <= limiar_azul_medio:
+                            color = '#6495ED'  # Azul médio
+                            opacity = 0.65
+                        elif count <= limiar_amarelo:
+                            color = '#FFFF00'  # Amarelo
+                            opacity = 0.7
+                        elif count <= limiar_laranja:
+                            color = '#FFA500'  # Laranja
+                            opacity = 0.75
+                        else:
+                            color = '#FF0000'  # Vermelho
+                            opacity = 0.8
+                    else:
+                        # Usando valores relativos (normalizados)
+                        # Normalizando a contagem para definir a cor (0-1)
+                        norm_count = count / max_count
+
+                        if norm_count < 0.2:
+                            color = '#ADD8E6'  # Azul claro
+                            opacity = 0.6
+                        elif norm_count < 0.4:
+                            color = '#6495ED'  # Azul médio
+                            opacity = 0.65
+                        elif norm_count < 0.6:
+                            color = '#FFFF00'  # Amarelo
+                            opacity = 0.7
+                        elif norm_count < 0.8:
+                            color = '#FFA500'  # Laranja
+                            opacity = 0.75
+                        else:
+                            color = '#FF0000'  # Vermelho
+                            opacity = 0.8
+
+                    # Texto do popup
+                    popup_text = f"""
+                    <strong>Registros:</strong> {cell_data['count']}<br>
+                    <strong>Espécies:</strong> {len(cell_data['species'])}<br>
+                    <strong>Coordenadas:</strong> {south:.4f},{west:.4f} a {north:.4f},{east:.4f}
+                    """
+
+                    # Criando retângulo para a célula com borda mais visível
+                    folium.Rectangle(
+                        bounds=[[south, west], [north, east]],
+                        color='black',
+                        weight=1,
+                        fill=True,
+                        fill_color=color,
+                        fill_opacity=opacity,
+                        popup=folium.Popup(popup_text, max_width=300)
+                    ).add_to(mapa)
+
+            except Exception as e:
+                st.error(f"Erro ao gerar mapa de grid: {e}")
+
+        return mapa
+
+    except Exception as e:
+        st.error(f"Erro ao gerar mapa: {e}")
+        # Retornar um mapa básico como fallback
+        return folium.Map(location=[-15.77972, -47.92972], zoom_start=4)
+
+
+# Função para gerar gráfico de registros por localidade
+def gerar_grafico_registros_por_localidade(df, tipo_grafico):
+    """Gera gráfico de registros por localidade conforme tipo selecionado"""
+    if 'municipio' not in df.columns or 'estado' not in df.columns:
+        return None
+
+    # Criando coluna de localidade (município/estado)
+    df['localidade'] = df['municipio'] + '/' + df['estado']
+
+    # Contando registros por localidade
+    registros_por_localidade = df['localidade'].value_counts().reset_index()
+    registros_por_localidade.columns = ['Localidade', 'Número de Registros']
+
+    # Obtendo as 20 principais localidades
+    top_localidades = registros_por_localidade.head(20)
+
+    if tipo_grafico == 'barras_horizontais':
+        fig = px.bar(
+            top_localidades,
+            y='Localidade',
+            x='Número de Registros',
+            title='Localidades com Mais Registros',
+            orientation='h',
+            color='Número de Registros',
+            color_continuous_scale='Viridis'
+        )
+    elif tipo_grafico == 'barras_verticais':
+        fig = px.bar(
+            top_localidades,
+            x='Localidade',
+            y='Número de Registros',
+            title='Localidades com Mais Registros',
+            color='Número de Registros',
+            color_continuous_scale='Viridis'
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+    elif tipo_grafico == 'pizza':
+        fig = px.pie(
+            top_localidades,
+            values='Número de Registros',
+            names='Localidade',
+            title='Distribuição de Registros por Localidade'
+        )
+
+    fig.update_layout(
+        xaxis_title='Localidade',
+        yaxis_title='Número de Registros',
+        autosize=True
+    )
+
+    return fig
+
+
+# Função para gerar gráficos personalizados
+def gerar_grafico_personalizado(df, tipo_grafico):
+    """Gera gráficos personalizados baseados na seleção do usuário"""
+    if df.empty:
+        return None
+
+    if tipo_grafico == 'linha':
+        # Gráfico de linha para análise temporal
+        if 'data' not in df.columns:
+            return None
+
+        # Agrupando por mês e ano
+        df_temporal = df.copy()
+        df_temporal['ano_mes'] = df_temporal['data'].dt.to_period('M')
+
+        # Contando registros por mês
+        contagem_temporal = df_temporal.groupby('ano_mes').size().reset_index()
+        contagem_temporal.columns = ['Ano-Mês', 'Número de Registros']
+        contagem_temporal['Ano-Mês'] = contagem_temporal['Ano-Mês'].astype(str)
+
+        fig = px.line(
+            contagem_temporal,
+            x='Ano-Mês',
+            y='Número de Registros',
+            title='Evolução Temporal dos Registros',
+            markers=True
+        )
+
+    elif tipo_grafico == 'linha_sazonalidade':
+        # Gráfico de linha para sazonalidade
+        if 'especie' not in df.columns or 'mes' not in df.columns:
+            return None
+
+        # Agrupamento por espécie e mês
+        especies_por_mes = df.groupby(['especie', 'mes']).size().reset_index(name='registros')
+
+        # Pegar as 5 espécies mais frequentes para não sobrecarregar o gráfico
+        top_especies = df['especie'].value_counts().nlargest(5).index.tolist()
+        especies_por_mes_filtrado = especies_por_mes[especies_por_mes['especie'].isin(top_especies)]
+
+        # Ordenar por mês
+        especies_por_mes_filtrado = especies_por_mes_filtrado.sort_values('mes')
+
+        # Adicionar nomes dos meses
+        especies_por_mes_filtrado['mes_nome'] = especies_por_mes_filtrado['mes'].apply(lambda x: calendar.month_abbr[x])
+
+        # Criar gráfico
+        fig = px.line(
+            especies_por_mes_filtrado,
+            x='mes_nome',
+            y='registros',
+            color='especie',
+            title='Sazonalidade das Espécies Mais Frequentes',
+            markers=True
+        )
+
+        # Ordenar eixo X por mês
+        fig.update_layout(
+            xaxis={'categoryorder': 'array',
+                   'categoryarray': [calendar.month_abbr[i] for i in range(1, 13)]},
+            xaxis_title='Mês',
+            yaxis_title='Número de Registros'
+        )
+
+    elif tipo_grafico == 'barras_verticais':
+        # Gráfico de barras verticais para análise sazonal (mês)
+        if 'mes' not in df.columns:
+            return None
+
+        # Contando registros por mês
+        contagem_meses = df.groupby('mes').size().reset_index()
+        contagem_meses.columns = ['Mês', 'Número de Registros']
+
+        # Ordenando os meses
+        contagem_meses = contagem_meses.sort_values('Mês')
+
+        # Adicionando nomes dos meses
+        nomes_meses = [calendar.month_name[m] for m in contagem_meses['Mês']]
+        contagem_meses['Nome do Mês'] = nomes_meses
+
+        fig = px.bar(
+            contagem_meses,
+            x='Nome do Mês',
+            y='Número de Registros',
+            title='Sazonalidade dos Registros (Mensal)',
+            color='Número de Registros',
+            color_continuous_scale='Viridis'
+        )
+
+        # Definindo ordem específica para os meses
+        fig.update_layout(
+            xaxis={'categoryorder': 'array',
+                   'categoryarray': [calendar.month_name[i] for i in range(1, 13)]}
+        )
+
+    elif tipo_grafico == 'roseta':
+        # Gráfico de roseta (circular) para análise sazonal
+        if 'mes' not in df.columns:
+            return None
+
+        # Contando registros por mês
+        contagem_meses = df.groupby('mes').size().reset_index()
+        contagem_meses.columns = ['Mês', 'Número de Registros']
+
+        # Ordenando os meses
+        contagem_meses = contagem_meses.sort_values('Mês')
+
+        # Criando roseta
+        fig = go.Figure()
+
+        fig.add_trace(go.Barpolar(
+            r=contagem_meses['Número de Registros'],
+            theta=[calendar.month_abbr[m] for m in contagem_meses['Mês']],
+            width=1,
+            marker_color=contagem_meses['Número de Registros'],
+            marker_colorscale='Viridis',
+            marker_showscale=True
+        ))
+
+        fig.update_layout(
+            title='Sazonalidade dos Registros (Roseta)',
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    showticklabels=True
+                )
+            )
+        )
+
+    return fig
+
+
+# Função para gerar gráfico de sazonalidade para uma espécie específica
+def gerar_grafico_sazonalidade_especie(df, especie):
+    """Gera gráfico de sazonalidade (registros por mês) para uma espécie específica"""
+    if 'especie' not in df.columns or 'mes' not in df.columns:
+        return None
+
+    # Filtrando pela espécie selecionada
+    df_especie = df[df['especie'] == especie]
+
+    if len(df_especie) == 0:
+        return None
+
+    # Contando registros por mês
+    contagem_meses = df_especie.groupby('mes').size().reindex(range(1, 13), fill_value=0)
+    contagem_meses = contagem_meses.reset_index()
+    contagem_meses.columns = ['Mês', 'Número de Registros']
+
+    # Adicionando nomes dos meses
+    contagem_meses['Nome do Mês'] = [calendar.month_name[m] for m in contagem_meses['Mês']]
+
+    # Criando gráfico
+    fig = px.bar(
+        contagem_meses,
+        x='Nome do Mês',
+        y='Número de Registros',
+        title=f'Sazonalidade: {especie}',
+        color='Número de Registros',
+        color_continuous_scale='Viridis'
+    )
+
+    # Definindo ordem específica para os meses
+    fig.update_layout(
+        xaxis={'categoryorder': 'array',
+               'categoryarray': [calendar.month_name[i] for i in range(1, 13)]},
+        xaxis_title='Mês',
+        yaxis_title='Número de Registros'
+    )
+
+    return fig
+
+
+# UI do Dashboard - Layout principal
+def main():
+    st.title("Chordeiles: Análise de sazonalidade de espécies")
+
+    # Sidebar - Opções e Filtros
+    st.sidebar.title("Upload de Dados")
+
+    # Opção para upload de arquivo ou Google Sheets
+    fonte_dados = st.sidebar.radio(
+        "Fonte de dados:",
+        options=["Upload de arquivo", "Google Sheets"]
+    )
+
+    # Inicializando o DataFrame de dados
+    df = pd.DataFrame()
+
+    if fonte_dados == "Upload de arquivo":
+        file_upload = st.sidebar.file_uploader(
+            "Fazer upload de arquivo CSV ou Excel:",
+            type=["csv", "xlsx", "xls"],
+            help="Selecione um arquivo CSV ou Excel contendo os dados para análise."
+        )
+
+        if file_upload is not None:
+            df = load_and_process_data(file_upload=file_upload)
+    else:
+        sheet_url = st.sidebar.text_input(
+            "Link do Google Sheets:",
+            help="Cole o link compartilhável do Google Sheets (permissão de visualização pública)."
+        )
+
+        if st.sidebar.button("Carregar Dados"):
+            if sheet_url and sheet_url.strip() != "":
+                df = load_and_process_data(sheet_url=sheet_url)
+
+    # Verificando se temos dados para trabalhar
+    if df.empty:
+        # Se não tiver dados, tentar carregar o arquivo de exemplo
+        try:
+            st.info("Tentando carregar arquivo de exemplo 'pachyramphus_chordeiles.csv'...")
+
+            # Verifica se o arquivo existe antes de tentar carregar
+            import os
+            if os.path.exists('pachyramphus_chordeiles.csv'):
+                df = pd.read_csv('pachyramphus_chordeiles.csv', low_memory=False)
+            else:
+                st.warning("Arquivo de exemplo não encontrado. Por favor, faça upload de um arquivo.")
+                # Criar um DataFrame vazio mas com as colunas necessárias
+                df = pd.DataFrame(columns=['id_registro', 'especie', 'municipio_estado', 'data',
+                                           'autor', 'municipio', 'estado', 'id_municipio',
+                                           'latitude', 'longitude'])
+                return
+
+            # Processando o arquivo de exemplo
+            if not df.empty:
+                # Padronizando colunas
+                df.rename(columns={
+                    'id registro': 'id_registro',
+                    'Espécie': 'especie',
+                    'municipio e estado': 'municipio_estado',
+                    'Data (d/m/a)': 'data',
+                    'Autor': 'autor',
+                    'Município': 'municipio',
+                    'uf': 'estado',
+                    'id município': 'id_municipio',
+                    'latitude': 'latitude',
+                    'longitude': 'longitude'
+                }, inplace=True)
+
+                # Processando a data
+                if 'data' in df.columns:
+                    df['data'] = df['data'].apply(converter_data)
+                    df['ano'] = df['data'].dt.year
+                    df['mes'] = df['data'].dt.month
+                    df['mes_nome'] = df['data'].dt.month_name()
+
+                st.success("Arquivo de exemplo carregado com sucesso!")
+            else:
+                st.warning(
+                    "Nenhum dado carregado. Por favor, faça upload de um arquivo ou forneça um link do Google Sheets.")
+                return
+        except Exception as e:
+            st.warning(
+                f"Nenhum dado carregado. Por favor, faça upload de um arquivo ou forneça um link do Google Sheets. Erro: {e}")
+            # Criar um DataFrame vazio mas com as colunas necessárias
+            df = pd.DataFrame(columns=['id_registro', 'especie', 'municipio_estado', 'data',
+                                       'autor', 'municipio', 'estado', 'id_municipio',
+                                       'latitude', 'longitude'])
+            return
+
+    # Sidebar - Filtros
+    st.sidebar.title("Filtros")
+
+    # Filtrando espécies disponíveis
+    especies_disponiveis = sorted(df['especie'].unique()) if 'especie' in df.columns else []
+
+    # Filtro de espécie - Multi-select
+    especie_selecionada = st.sidebar.multiselect(
+        "Filtro Espécie",
+        options=especies_disponiveis,
+        default=[]
+    )
+
+    # Dicionário de regiões e seus estados
+    regioes_brasil = {
+        "Todas": [],
+        "Norte": ["AC", "AP", "AM", "PA", "RO", "RR", "TO"],
+        "Nordeste": ["MA", "PI", "CE", "RN", "PB", "PE", "AL", "SE", "BA"],
+        "Centro-Oeste": ["DF", "GO", "MT", "MS"],
+        "Sudeste": ["ES", "MG", "RJ", "SP"],
+        "Sul": ["PR", "SC", "RS"]
+    }
+
+    # Filtrando estados disponíveis
+    estados_disponiveis = sorted(df['estado'].unique()) if 'estado' in df.columns else []
+
+    # Seleção de região
+    regiao_selecionada = st.sidebar.selectbox(
+        "Filtrar por Região",
+        options=list(regioes_brasil.keys())
+    )
+
+    # Filtro de estado - Multi-select
+    # Pré-selecionar estados da região escolhida
+    estados_pre_selecionados = []
+    if regiao_selecionada != "Todas":
+        estados_pre_selecionados = [estado for estado in estados_disponiveis if
+                                    estado in regioes_brasil[regiao_selecionada]]
+
+    estado_selecionado = st.sidebar.multiselect(
+        "Filtro Estado",
+        options=estados_disponiveis,
+        default=estados_pre_selecionados
+    )
+
+    # Filtrando municípios disponíveis
+    municipios_disponiveis = sorted(df['municipio'].unique()) if 'municipio' in df.columns else []
+
+    # Filtro de município - Multi-select
+    municipio_selecionado = st.sidebar.multiselect(
+        "Filtro Município",
+        options=municipios_disponiveis,
+        default=[]
+    )
+
+    # Dicionário de estações e seus meses
+    estacoes_ano = {
+        "Todas": [],
+        "Verão": [12, 1, 2],  # Dezembro, Janeiro, Fevereiro
+        "Outono": [3, 4, 5],  # Março, Abril, Maio
+        "Inverno": [6, 7, 8],  # Junho, Julho, Agosto
+        "Primavera": [9, 10, 11]  # Setembro, Outubro, Novembro
+    }
+
+    # Seleção de estação
+    estacao_selecionada = st.sidebar.selectbox(
+        "Filtrar por Estação",
+        options=list(estacoes_ano.keys())
+    )
+
+    # Filtro de mês - Multi-select
+    # Pré-selecionar meses da estação escolhida
+    meses_disponiveis = [i for i in range(1, 13)]
+    meses_nomes = [calendar.month_name[i] for i in meses_disponiveis]
+
+    meses_pre_selecionados = []
+    if estacao_selecionada != "Todas":
+        meses_pre_selecionados = [calendar.month_name[i] for i in estacoes_ano[estacao_selecionada]]
+
+    mes_selecionado = st.sidebar.multiselect(
+        "Filtro Mês",
+        options=meses_nomes,
+        default=meses_pre_selecionados
+    )
+
+    # Filtrando anos disponíveis
+    anos_disponiveis = sorted(df['ano'].unique()) if 'ano' in df.columns else []
+
+    # Filtro de ano - Multi-select
+    ano_selecionado = st.sidebar.multiselect(
+        "Filtro Ano",
+        options=[str(ano) for ano in anos_disponiveis],
+        default=[]
+    )
+
+    # Aplicando filtros
+    df_filtrado = df.copy()
+
+    # Filtrar por espécie
+    if especie_selecionada and 'especie' in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado['especie'].isin(especie_selecionada)]
+
+    # Filtrar por município
+    if municipio_selecionado and 'municipio' in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado['municipio'].isin(municipio_selecionado)]
+
+    # Filtrar por estado
+    if estado_selecionado and 'estado' in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado['estado'].isin(estado_selecionado)]
+
+    # Filtrar por ano
+    if ano_selecionado and 'ano' in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado['ano'].isin([int(ano) for ano in ano_selecionado])]
+
+    # Filtrar por mês
+    if mes_selecionado and 'mes_nome' in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado['mes_nome'].isin(mes_selecionado)]
+
+    # Calculando indicadores
+    indicadores = calcular_indicadores(df_filtrado)
+
+    # Painel Geral - Período e Indicadores
+    st.markdown("## Painel geral")
+
+    # Cards para indicadores com componentes nativos do Streamlit
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(label="TOTAL DE REGISTROS", value=indicadores['n_registros'])
+
+    with col2:
+        st.metric(label="TOTAL DE ESPÉCIES", value=indicadores['n_especies'])
+
+    with col3:
+        st.metric(label="TOTAL DE LOCALIDADES ÚNICAS", value=indicadores['n_localizacoes'])
+
+    # Período amostral
+    st.info(f"**PERÍODO AMOSTRAL:** {indicadores['periodo_dados']}")
+
+    st.markdown("---")
+
+    # Registros por espécie - Tabela e Gráfico
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Registros por espécie")
+
+        tabela_especies = gerar_tabela_registros_por_especie(df_filtrado)
+        if not tabela_especies.empty:
+            st.dataframe(tabela_especies, height=400)
+        else:
+            st.warning("Dados insuficientes para gerar a tabela.")
+
+    with col2:
+        st.markdown("### Registros por espécie")
+
+        opcoes_grafico_especies = [
+            "Barras horizontais",
+            "Barras verticais",
+            "Pizza"
+        ]
+
+        tipo_grafico_especies = st.selectbox(
+            "Tipo de gráfico:",
+            options=opcoes_grafico_especies,
+            key="grafico_especies"
+        )
+
+        tipo_map = {
+            "Barras horizontais": "barras_horizontais",
+            "Barras verticais": "barras_verticais",
+            "Pizza": "pizza"
+        }
+
+        fig_especies = gerar_grafico_registros_por_especie(df_filtrado, tipo_map[tipo_grafico_especies])
+        if fig_especies:
+            st.plotly_chart(fig_especies, use_container_width=True)
+        else:
+            st.warning("Dados insuficientes para gerar o gráfico.")
+
+    st.markdown("---")
+
+    # Mapa geral e Gráfico por localidade
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Mapa geral de registro")
+
+        opcoes_mapa = [
+            "Mapa de pontos",
+            "Mapa de calor",
+            "Mapa de grid"
+        ]
+
+        tipo_mapa = st.selectbox(
+            "Tipo de mapa:",
+            options=opcoes_mapa
+        )
+
+        tipo_mapa_map = {
+            "Mapa de pontos": "pontos",
+            "Mapa de calor": "calor",
+            "Mapa de grid": "grid"
+        }
+
+        # Opção para agrupar pontos (mostrar apenas se for mapa de pontos)
+        if tipo_mapa == "Mapa de pontos":
+            agrupar_pontos = st.checkbox("Agrupar pontos próximos", value=True,
+                                         help="Quando marcado, agrupa pontos próximos para melhor visualização. Desmarque para ver pontos individuais.")
+        else:
+            agrupar_pontos = True
+
+        # Se for mapa de grid, mostrar as informações em um container expandível
+        if tipo_mapa == "Mapa de grid":
+            with st.expander("Detalhes do grid", expanded=False):
+                st.info(
+                    "Criando visualização de grid. Esta análise divide a área em células e conta registros em cada uma.")
+                grid_size = st.slider("Tamanho do grid (células)", min_value=5, max_value=100, value=30,
+                                      help="Define a resolução do grid. Valores maiores criam células menores.")
+        else:
+            grid_size = 30
+
+        # Aviso sobre problemas de mapa
+        st.info("Se o mapa não aparecer, tente reduzir a quantidade de dados usando os filtros")
+
+        mapa = gerar_mapa_registros(df_filtrado, tipo_mapa_map[tipo_mapa], agrupar_pontos, grid_size)
+        if mapa:
+            try:
+                # Usando uma altura maior para mapas de grid, que precisam de mais espaço
+                altura_mapa = 500 if tipo_mapa == "Mapa de grid" else 450
+                st_folium(mapa, width='100%', height=altura_mapa, key="mapa_geral")
+            except Exception as e:
+                st.error(f"Erro ao exibir o mapa: {e}")
+                st.info("Tente aplicar mais filtros para reduzir o volume de dados")
+        else:
+            st.warning("Dados insuficientes para gerar o mapa.")
+
+        st.caption("Visualização do mapa automaticamente ajustada para os dados")
+
+    with col2:
+        st.markdown("### Gráfico de registros por localidade")
+
+        opcoes_grafico_localidade = [
+            "Barras horizontais",
+            "Barras verticais",
+            "Pizza"
+        ]
+
+        tipo_grafico_localidade = st.selectbox(
+            "Tipo de gráfico:",
+            options=opcoes_grafico_localidade,
+            key="grafico_localidade"
+        )
+
+        fig_localidade = gerar_grafico_registros_por_localidade(
+            df_filtrado,
+            tipo_map[tipo_grafico_localidade]
+        )
+
+        if fig_localidade:
+            st.plotly_chart(fig_localidade, use_container_width=True)
+        else:
+            st.warning("Dados insuficientes para gerar o gráfico.")
+
+    st.markdown("---")
+
+    # Mapa personalizado
+    st.markdown("### Opções de personalização do mapa")
+
+    opcoes_mapa_personalizado = [
+        "Mapa de pontos",
+        "Mapa de calor",
+        "Mapa de grid",
+        "Mapa com filtro de espécie"
+    ]
+
+    # Usando uma chave específica para este selectbox para evitar conflitos
+    tipo_mapa_personalizado = st.selectbox(
+        "Tipo de mapa:",
+        options=opcoes_mapa_personalizado,
+        key="mapa_personalizado_tipo"
+    )
+
+    # Aplicar filtros adicionais conforme seleção
+    df_mapa_personalizado = df_filtrado.copy()
+
+    if tipo_mapa_personalizado == "Mapa com filtro de espécie":
+        # Usando uma chave específica para este selectbox também
+        if especies_disponiveis:
+            especie_mapa = st.selectbox(
+                "Espécie para o mapa:",
+                options=especies_disponiveis,
+                key="especie_mapa_select"
+            )
+
+            df_mapa_personalizado = df_mapa_personalizado[df_mapa_personalizado['especie'] == especie_mapa]
+        else:
+            st.warning("Não há espécies disponíveis com os filtros atuais.")
+
+    tipo_mapa_pers_map = {
+        "Mapa de pontos": "pontos",
+        "Mapa de calor": "calor",
+        "Mapa de grid": "grid",
+        "Mapa com filtro de espécie": "pontos"
+    }
+
+    # Opção para agrupar pontos (mostrar apenas se for mapa de pontos)
+    if tipo_mapa_personalizado in ["Mapa de pontos", "Mapa com filtro de espécie"]:
+        agrupar_pontos_pers = st.checkbox("Agrupar pontos próximos", value=True,
+                                          help="Quando marcado, agrupa pontos próximos para melhor visualização. Desmarque para ver pontos individuais.",
+                                          key="agrupar_pontos_pers")
+    else:
+        agrupar_pontos_pers = True
+
+    # Opção para tamanho do grid (mostrar apenas se for mapa de grid)
+    if tipo_mapa_personalizado == "Mapa de grid":
+        with st.expander("Detalhes do grid", expanded=False):
+            st.info(
+                "Criando visualização de grid. Esta análise divide a área em células e conta registros em cada uma.")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                grid_size_pers = st.slider("Tamanho do grid (células)", min_value=5, max_value=100, value=30,
+                                           help="Define a resolução do grid. Valores maiores criam células menores.",
+                                           key="grid_size_pers")
+
+            with col2:
+                usar_valores_personalizados = st.checkbox("Usar valores personalizados para cores",
+                                                          value=False,
+                                                          help="Define manualmente os limiares de cores",
+                                                          key="usar_valores_personalizados")
+
+            if usar_valores_personalizados:
+                st.write("Define os limiares para cada cor do grid:")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    limiar_azul = st.number_input("Azul claro (até)", value=5, min_value=1, step=1,
+                                                  key="limiar_azul")
+                    limiar_azul_medio = st.number_input("Azul médio (até)", value=10, min_value=limiar_azul + 1, step=1,
+                                                        key="limiar_azul_medio")
+
+                with col2:
+                    limiar_amarelo = st.number_input("Amarelo (até)", value=20, min_value=limiar_azul_medio + 1, step=1,
+                                                     key="limiar_amarelo")
+                    limiar_laranja = st.number_input("Laranja (até)", value=50, min_value=limiar_amarelo + 1, step=1,
+                                                     key="limiar_laranja")
+
+                st.write(f"Vermelho: mais de {limiar_laranja} registros")
+            else:
+                # Valores padrão se não estiver usando personalizados
+                limiar_azul = 5
+                limiar_azul_medio = 10
+                limiar_amarelo = 20
+                limiar_laranja = 50
+    else:
+        grid_size_pers = 30
+        usar_valores_personalizados = False
+        limiar_azul = 5
+        limiar_azul_medio = 10
+        limiar_amarelo = 20
+        limiar_laranja = 50
+
+    # Aviso sobre problemas de mapa
+    st.info("Se o mapa não aparecer, tente reduzir a quantidade de dados usando os filtros")
+
+    # Garantindo que temos uma chave válida
+    tipo_map_key = tipo_mapa_pers_map.get(tipo_mapa_personalizado, "pontos")
+
+    mapa_personalizado = gerar_mapa_registros(df_mapa_personalizado, tipo_map_key, agrupar_pontos_pers,
+                                              grid_size_pers if tipo_mapa_personalizado == "Mapa de grid" else 30,
+                                              usar_valores_personalizados, limiar_azul, limiar_azul_medio,
+                                              limiar_amarelo, limiar_laranja)
+    if mapa_personalizado:
+        try:
+            # Usando uma altura maior para mapas de grid, que precisam de mais espaço
+            altura_mapa = 500 if tipo_mapa_personalizado == "Mapa de grid" else 450
+            st_folium(mapa_personalizado, width='100%', height=altura_mapa, key="mapa_pers_visual")
+        except Exception as e:
+            st.error(f"Erro ao exibir o mapa personalizado: {e}")
+            st.info("Tente aplicar mais filtros para reduzir o volume de dados")
+    else:
+        st.warning("Dados insuficientes para gerar o mapa personalizado.")
+
+    st.caption("Visualização do mapa automaticamente ajustada para os dados")
+
+    st.markdown("---")
+
+    # Gráfico personalizado
+    st.markdown("### Opções de personalização do gráfico")
+
+    opcoes_grafico_personalizado = [
+        "Gráfico de linha (tendência temporal)",
+        "Gráfico de linha (sazonalidade)",
+        "Gráfico de barras verticais (sazonalidade)",
+        "Gráfico de roseta (sazonalidade)"
+    ]
+
+    tipo_grafico_personalizado = st.selectbox(
+        "Tipo de gráfico:",
+        options=opcoes_grafico_personalizado
+    )
+
+    tipo_grafico_pers_map = {
+        "Gráfico de linha (tendência temporal)": "linha",
+        "Gráfico de linha (sazonalidade)": "linha_sazonalidade",
+        "Gráfico de barras verticais (sazonalidade)": "barras_verticais",
+        "Gráfico de roseta (sazonalidade)": "roseta"
+    }
+
+    fig_personalizado = gerar_grafico_personalizado(
+        df_filtrado,
+        tipo_grafico_pers_map[tipo_grafico_personalizado]
+    )
+
+    if fig_personalizado:
+        st.plotly_chart(fig_personalizado, use_container_width=True)
+    else:
+        st.warning("Dados insuficientes para gerar o gráfico personalizado.")
+
+    # Se for uma opção de sazonalidade e houver espécies disponíveis, permitir seleção de espécie específica
+    if tipo_grafico_personalizado in ["Gráfico de barras verticais (sazonalidade)", "Gráfico de roseta (sazonalidade)"]:
+        if especies_disponiveis:
+            st.subheader("Análise de sazonalidade por espécie")
+
+            especie_sazonalidade = st.selectbox(
+                "Selecione uma espécie para analisar sazonalidade:",
+                options=especies_disponiveis
+            )
+
+            fig_sazonalidade = gerar_grafico_sazonalidade_especie(df_filtrado, especie_sazonalidade)
+
+            if fig_sazonalidade:
+                st.plotly_chart(fig_sazonalidade, use_container_width=True)
+            else:
+                st.warning("Dados insuficientes para gerar o gráfico de sazonalidade.")
+
+    # Rodapé
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="text-align: center; font-size: 0.8rem;">
+            Dashboard de Análise de Sazonalidade | Versão 1.0 | Desenvolvido com Streamlit
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+if __name__ == "__main__":
+    main()
